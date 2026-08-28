@@ -28,13 +28,12 @@ std::mutex g_result_mutex;
 Result g_last;
 
 constexpr DWORD kItemConfirmationTimeoutMs = 3000;
-constexpr DWORD kInterItemDelayMs = 150;
 constexpr DWORD kOrganizeCooldownMs = 1500;
 
 enum class Phase {
   kIdle,
   kReady,
-  kWaitingForSlotChange,
+  kWaitingForInventoryResync,
   kOrganizeCooldown,
 };
 
@@ -46,10 +45,18 @@ struct Candidate {
   std::wstring name;
 };
 
+struct BatchExpectation {
+  int32_t quality = -1;
+  int32_t action = config::kKeep;
+  int32_t count_before = 0;
+  int32_t requested_count = 0;
+  std::wstring name;
+};
+
 Phase g_phase = Phase::kIdle;
 std::vector<Candidate> g_candidates;
-size_t g_next_candidate = 0;
-Candidate g_inflight;
+std::vector<BatchExpectation> g_expectations;
+size_t g_initial_candidate_count = 0;
 DWORD g_due_tick = 0;
 Result g_current;
 bool g_cooldown_completed = false;
@@ -86,6 +93,23 @@ std::wstring ReadName(uint32_t item) {
       mem::ReadDword(item + addr::kOffEquipName, 0);
   return name_ptr != 0 ? mem::ReadWideString(name_ptr, 48)
                        : std::wstring();
+}
+
+bool TryCountMatchingItems(int32_t quality, const std::wstring& name,
+                           int32_t& count) {
+  count = 0;
+  const uint32_t list = runtime::EquipListBase();
+  if (list == 0) return false;
+
+  constexpr uint32_t kReadFailed = 0xFFFFFFFFu;
+  for (int32_t index = 0; index < addr::kEquipSlotCount; ++index) {
+    const uint32_t item = mem::ReadDword(
+        list + static_cast<uint32_t>(index) * sizeof(uint32_t), kReadFailed);
+    if (item == kReadFailed) return false;
+    if (item == 0 || ReadQuality(item) != quality) continue;
+    if (ReadName(item) == name) ++count;
+  }
+  return true;
 }
 
 // 名称是否命中过滤列表。
@@ -131,12 +155,13 @@ void FinishBatch(bool completed, const wchar_t* reason) {
   nflog::Write(
       L"[一键处理] %s reason=%s scanned=%d candidates=%u confirmed=%u",
       completed ? L"完成" : L"中止", reason ? reason : L"?",
-      g_current.scanned, static_cast<unsigned int>(g_candidates.size()),
+      g_current.scanned,
+      static_cast<unsigned int>(g_initial_candidate_count),
       static_cast<unsigned int>(confirmed));
 
   g_candidates.clear();
-  g_next_candidate = 0;
-  g_inflight = Candidate();
+  g_expectations.clear();
+  g_initial_candidate_count = 0;
   g_due_tick = 0;
   g_cooldown_completed = false;
   g_cooldown_reason.clear();
@@ -202,24 +227,17 @@ bool RevalidateCandidate(const Candidate& candidate,
   return true;
 }
 
-void StartBatch() {
-  if (!g_busy.load()) return;
-
+bool BuildCandidates(bool update_scanned, std::wstring& error_reason) {
   const config::Settings cfg = config::Get();
   const std::vector<std::wstring> filters = cfg.ParsedNameFilters();
-  g_current = Result();
-  g_candidates.clear();
-  g_next_candidate = 0;
-  g_inflight = Candidate();
-  g_cooldown_completed = false;
-  g_cooldown_reason.clear();
-
   const uint32_t list = runtime::EquipListBase();
   if (list == 0) {
-    FinishBatch(false, L"装备背包不可用");
-    return;
+    error_reason = L"装备背包不可用";
+    return false;
   }
 
+  std::vector<Candidate> candidates;
+  int32_t scanned = 0;
   for (int i = 1; i <= addr::kEquipSlotCount; ++i) {
     const uint32_t item =
         mem::ReadDword(list + static_cast<uint32_t>(i - 1) * 4, 0);
@@ -229,9 +247,7 @@ void StartBatch() {
     if (quality < 0 || quality >= config::kQualityCount) continue;
 
     const std::wstring name = ReadName(item);
-    ++g_current.scanned;
-
-    // 无法确认名称时宁可保留，避免内存读取异常时处理未知装备。
+    ++scanned;
     if (name.empty()) continue;
     if (!filters.empty() && NameFiltered(name, filters)) continue;
 
@@ -245,8 +261,107 @@ void StartBatch() {
     candidate.quality = quality;
     candidate.action = action;
     candidate.name = name;
-    g_candidates.push_back(std::move(candidate));
+    candidates.push_back(std::move(candidate));
   }
+
+  g_candidates = std::move(candidates);
+  if (update_scanned) g_current.scanned = scanned;
+  return true;
+}
+
+bool BuildBatchExpectations(const std::vector<Candidate>& candidates,
+                            std::wstring& error_reason) {
+  g_expectations.clear();
+  for (const Candidate& candidate : candidates) {
+    BatchExpectation* expectation = nullptr;
+    for (BatchExpectation& current : g_expectations) {
+      if (current.quality == candidate.quality &&
+          current.action == candidate.action &&
+          current.name == candidate.name) {
+        expectation = &current;
+        break;
+      }
+    }
+
+    if (expectation == nullptr) {
+      BatchExpectation current;
+      current.quality = candidate.quality;
+      current.action = candidate.action;
+      current.name = candidate.name;
+      if (!TryCountMatchingItems(current.quality, current.name,
+                                 current.count_before)) {
+        error_reason = L"无法建立处理前装备计数";
+        g_expectations.clear();
+        return false;
+      }
+      g_expectations.push_back(std::move(current));
+      expectation = &g_expectations.back();
+    }
+    ++expectation->requested_count;
+  }
+
+  for (const BatchExpectation& expectation : g_expectations) {
+    if (expectation.count_before < expectation.requested_count) {
+      error_reason = L"处理前装备计数与候选数量不一致";
+      g_expectations.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TryMeasureBatch(std::vector<int32_t>& confirmed_counts,
+                     int32_t& confirmed_total, bool& complete) {
+  confirmed_counts.clear();
+  confirmed_total = 0;
+  complete = true;
+  for (const BatchExpectation& expectation : g_expectations) {
+    int32_t current_count = 0;
+    if (!TryCountMatchingItems(expectation.quality, expectation.name,
+                               current_count)) {
+      return false;
+    }
+
+    int32_t confirmed = expectation.count_before - current_count;
+    if (confirmed < 0) confirmed = 0;
+    if (confirmed > expectation.requested_count)
+      confirmed = expectation.requested_count;
+    if (confirmed < expectation.requested_count) complete = false;
+    confirmed_counts.push_back(confirmed);
+    confirmed_total += confirmed;
+  }
+  return true;
+}
+
+void ApplyBatchResults(const std::vector<int32_t>& confirmed_counts) {
+  for (size_t index = 0;
+       index < g_expectations.size() && index < confirmed_counts.size();
+       ++index) {
+    const BatchExpectation& expectation = g_expectations[index];
+    const int32_t confirmed = confirmed_counts[index];
+    if (expectation.action == config::kSell)
+      g_current.sold[expectation.quality] += confirmed;
+    else if (expectation.action == config::kDisassemble)
+      g_current.disassembled[expectation.quality] += confirmed;
+  }
+}
+
+void StartBatch() {
+  if (!g_busy.load()) return;
+
+  g_current = Result();
+  g_candidates.clear();
+  g_expectations.clear();
+  g_initial_candidate_count = 0;
+  g_cooldown_completed = false;
+  g_cooldown_reason.clear();
+
+  std::wstring error_reason;
+  if (!BuildCandidates(true, error_reason)) {
+    FinishBatch(false, error_reason.c_str());
+    return;
+  }
+  g_initial_candidate_count = g_candidates.size();
 
   nflog::Write(L"[一键处理] 开始 scanned=%d candidates=%u",
                g_current.scanned,
@@ -278,44 +393,33 @@ void Tick() {
   if (!g_busy.load() || !gthread::IsGameThread()) return;
 
   const DWORD now = GetTickCount();
-  if (g_phase == Phase::kWaitingForSlotChange) {
-    uint32_t current_item = 0;
-    if (!TryReadSlotItem(g_inflight.slot, current_item)) {
-      nflog::Write(
-          L"[一键处理] 等待期间装备背包不可读，停止后续请求 slot=%d",
-          g_inflight.slot);
-      EnterCooldown(false, L"等待期间装备背包不可读", now);
-      return;
-    }
-    if (current_item == 0) {
-      if (g_inflight.action == config::kSell)
-        ++g_current.sold[g_inflight.quality];
-      else if (g_inflight.action == config::kDisassemble)
-        ++g_current.disassembled[g_inflight.quality];
-
-      nflog::Write(L"[一键处理] 已确认 slot=%d quality=%d action=%d",
-                   g_inflight.slot, g_inflight.quality,
-                   g_inflight.action);
-      g_inflight = Candidate();
-      g_phase = Phase::kReady;
-      g_due_tick = now + kInterItemDelayMs;
+  if (g_phase == Phase::kWaitingForInventoryResync) {
+    std::vector<int32_t> confirmed_counts;
+    int32_t confirmed_total = 0;
+    bool complete = false;
+    if (!TryMeasureBatch(confirmed_counts, confirmed_total, complete)) {
+      nflog::Write(L"[一键处理] 批量同步期间装备背包不可读");
+      EnterCooldown(false, L"整理同步期间装备背包不可读", now);
       return;
     }
 
-    if (current_item != g_inflight.item) {
+    if (complete) {
+      ApplyBatchResults(confirmed_counts);
       nflog::Write(
-          L"[一键处理] 槽位被其他装备替换，停止后续请求 slot=%d old=%p new=%p",
-          g_inflight.slot, reinterpret_cast<void*>(g_inflight.item),
-          reinterpret_cast<void*>(current_item));
-      EnterCooldown(false, L"等待期间目标槽被其他装备替换", now);
+          L"[一键处理] 批量同步完成 requested=%u confirmed=%d",
+          static_cast<unsigned int>(g_candidates.size()), confirmed_total);
+      FinishBatch(true, L"全部请求已确认并完成整理");
       return;
     }
 
     if (TickReached(now, g_due_tick)) {
+      ApplyBatchResults(confirmed_counts);
       nflog::Write(
-          L"[一键处理] 等待超时，停止后续请求 slot=%d quality=%d action=%d",
-          g_inflight.slot, g_inflight.quality, g_inflight.action);
-      EnterCooldown(false, L"服务端未确认当前槽位变化", now);
+          L"[一键处理] 批量同步超时 requested=%u confirmed=%d unconfirmed=%u",
+          static_cast<unsigned int>(g_candidates.size()), confirmed_total,
+          static_cast<unsigned int>(g_candidates.size()) -
+              static_cast<unsigned int>(confirmed_total));
+      FinishBatch(false, L"整理同步后存在未确认请求");
     }
     return;
   }
@@ -328,8 +432,9 @@ void Tick() {
 
   if (g_phase != Phase::kReady || !TickReached(now, g_due_tick)) return;
 
-  while (g_next_candidate < g_candidates.size()) {
-    const Candidate candidate = g_candidates[g_next_candidate++];
+  std::vector<Candidate> validated;
+  validated.reserve(g_candidates.size());
+  for (const Candidate& candidate : g_candidates) {
     std::wstring reject_reason;
     bool fatal = false;
     if (!RevalidateCandidate(candidate, reject_reason, fatal)) {
@@ -342,25 +447,39 @@ void Tick() {
       }
       continue;
     }
+    validated.push_back(candidate);
+  }
 
-    g_inflight = candidate;
+  if (validated.empty()) {
+    FinishBatch(true, L"候选槽位均已变化或无需处理");
+    return;
+  }
+
+  std::wstring error_reason;
+  if (!BuildBatchExpectations(validated, error_reason)) {
+    EnterCooldown(false, error_reason.c_str(), now);
+    return;
+  }
+
+  for (const Candidate& candidate : validated) {
     if (candidate.action == config::kSell)
       packet::SellItem(candidate.slot, 1);
     else
       packet::Disassemble(candidate.slot);
 
-    nflog::Write(L"[一键处理] 已发送 slot=%d quality=%d action=%d name=%s",
-                 candidate.slot, candidate.quality, candidate.action,
-                 candidate.name.c_str());
-    g_phase = Phase::kWaitingForSlotChange;
-    g_due_tick = now + kItemConfirmationTimeoutMs;
-    return;
+    nflog::Write(
+        L"[一键处理] 批量已发送 slot=%d quality=%d action=%d name=%s",
+        candidate.slot, candidate.quality, candidate.action,
+        candidate.name.c_str());
   }
 
-  // 所有目标槽都已逐一确认变化后才允许整理，避免整理与尚在途的槽位请求竞态。
+  // 服务端按同一 TCP 会话串行处理，最终整理位于全部请求之后。
   packet::OrganizeBag(1, 0);
-  nflog::Write(L"[一键处理] 全部槽位已确认，发送整理并进入冷却");
-  EnterCooldown(true, L"全部请求已确认并完成整理", now);
+  nflog::Write(L"[一键处理] 批量请求已排队 count=%u，发送一次最终整理",
+               static_cast<unsigned int>(validated.size()));
+  g_candidates = std::move(validated);
+  g_phase = Phase::kWaitingForInventoryResync;
+  g_due_tick = now + kItemConfirmationTimeoutMs;
 }
 
 bool Busy() { return g_busy.load(); }
